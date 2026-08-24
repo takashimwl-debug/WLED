@@ -1,6 +1,8 @@
 #include "wled.h"
-#include <HTTPClient.h>
-#include <mbedtls/md.h> // Integrierte Krypto-Bibliothek für den Secret Key (HMAC-SHA256)
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 
 class SwitchBotControl : public Usermod {
 
@@ -8,25 +10,22 @@ class SwitchBotControl : public Usermod {
     bool enabled = false;
     bool initDone = false;
     
-    // Globale API Einstellungen
-    String apiToken = "";                                 
-    String secretKey = "";                                
-    String deviceId = "";
-    uint8_t action = 0;      // Standard-Aktion: 0=toggle, 1=on, 2=off
-
+    // SwitchBot PM1 BLE Einstellungen
+    String deviceMacAddress = "";  // MAC-Adresse des SwitchBot PM1
+    uint8_t action = 0;      // 0=toggle, 1=on, 2=off
+    
     unsigned long lastRequestTime = 0;
-    uint16_t minRequestInterval = 2000; // 2 Sekunden Schutzabstand wegen Cloud-Latenz
+    uint16_t minRequestInterval = 1000; // 1 Sekunde Abstand
+    
+    BLEScan* pBLEScan = nullptr;
     
     static const char _name[];
     static const char _enabled[];
-    static const char _apiToken[];
-    static const char _secretKey[];
-    static const char _deviceId[];
+    static const char _deviceMac[];
     static const char _action[];
 
-    bool sendSwitchBotCommand(uint8_t actionToSnd);
-    String getActionString(uint8_t actionToSnd);
-    String generateSignature(const String& token, const String& secret, const String& t, const String& nonce);
+    bool sendBLECommand(uint8_t actionToSnd);
+    uint8_t getCommandByte(uint8_t actionToSnd);
 
   public:
     inline void enable(bool en) { enabled = en; }
@@ -35,33 +34,55 @@ class SwitchBotControl : public Usermod {
     uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
 
     void setup() override {
+      if (!enabled) return;
+      
+      BLEDevice::init("");
+      pBLEScan = BLEDevice::getScan();
+      pBLEScan->setActiveScan(true);
+      pBLEScan->setInterval(100);
+      pBLEScan->setWindow(99);
+      
       initDone = true;
+      DEBUG_PRINTLN(F("SwitchBot PM1 initialized"));
     }
 
     void connected() override {}
-    void loop() override {}
+    
+    void loop() override {
+      if (!enabled || !initDone) return;
+      
+      // Optional: Periodisch Status abfragen
+      if (millis() - lastRequestTime > 60000) { // Alle 60 Sekunden
+        // Könnte hier Status-Check implementieren
+      }
+    }
 
     /**
      * NATIVE WLED HTTP-GET INTERFACE
-     * Fängt Web-Aufrufe über den Standard /win Pfad ab.
-     * Aufrufbar im Browser über: http://<ESP-IP>/win&SB=toggle
+     * Aufrufbar über: http://<ESP-IP>/win?SB=toggle
      */
-  void handleHttpGet(AsyncWebServerRequest *request) {
-      if (!enabled || !initDone || apiToken.isEmpty() || secretKey.isEmpty() || deviceId.isEmpty()) return;
+    void handleHttpGet(AsyncWebServerRequest *request) {
+      if (!enabled || !initDone || deviceMacAddress.isEmpty()) {
+        return request->send(400, "text/plain", "SwitchBot not configured");
+      }
 
-      // Prüfen, ob der "SB" Parameter in der URL vorkommt
       if (request->hasParam("SB")) {
         String reqParam = request->getParam("SB")->value();
-        uint8_t targetAction = action; // Fallback auf Standard-Einstellung
+        uint8_t targetAction = action;
 
         if (reqParam == "on" || reqParam == "1")        targetAction = 1;
         else if (reqParam == "off" || reqParam == "2")  targetAction = 2;
         else if (reqParam == "toggle" || reqParam == "0") targetAction = 0;
 
         if (millis() - lastRequestTime > minRequestInterval) {
-          sendSwitchBotCommand(targetAction);
+          bool success = sendBLECommand(targetAction);
           lastRequestTime = millis();
-          request->send(200, "text/plain", "SwitchBot Command Sent");
+          
+          if (success) {
+            request->send(200, "text/plain", "SwitchBot PM1 Command Sent");
+          } else {
+            request->send(500, "text/plain", "Failed to send command");
+          }
         } else {
           request->send(429, "text/plain", "Rate Limit - Please Wait");
         }
@@ -73,16 +94,14 @@ class SwitchBotControl : public Usermod {
       JsonObject user = root["u"];
       if (user.isNull()) user = root.createNestedObject("u");
       JsonArray info = user.createNestedArray(FPSTR(_name));
-      info.add(F("SwitchBot Link"));
-      info.add(F("Bereit für /win&SB=toggle"));
+      info.add(F("SwitchBot PM1"));
+      info.add(F("Use /win?SB=toggle"));
     }
 
     void addToConfig(JsonObject& root) override {
       JsonObject top = root.createNestedObject(FPSTR(_name));
       top[FPSTR(_enabled)] = enabled;
-      top[FPSTR(_apiToken)] = apiToken;
-      top[FPSTR(_secretKey)] = secretKey;
-      top[FPSTR(_deviceId)] = deviceId;
+      top[FPSTR(_deviceMac)] = deviceMacAddress;
       top[FPSTR(_action)] = action;
     }
 
@@ -91,102 +110,77 @@ class SwitchBotControl : public Usermod {
       if (top.isNull()) return false;
       
       enabled = top[FPSTR(_enabled)] | false;
-      apiToken = top[FPSTR(_apiToken)] | "";
-      secretKey = top[FPSTR(_secretKey)] | "";
-      deviceId = top[FPSTR(_deviceId)] | "";
+      deviceMacAddress = top[FPSTR(_deviceMac)] | "";
       action = top[FPSTR(_action)] | 0;
       
       return true;
     }
 
     void appendConfigData() override {
-      oappend(F("addInfo('SwitchBot:apiToken',1,'Open API Token');"));
-      oappend(F("addInfo('SwitchBot:secretKey',1,'Developer Secret Key');"));
-      oappend(F("addInfo('SwitchBot:deviceId',1,'SwitchBot Device ID');"));
+      oappend(F("addInfo('SwitchBot:deviceMac',1,'SwitchBot PM1 MAC Address (XX:XX:XX:XX:XX:XX)');"));
     }
 };
 
 const char SwitchBotControl::_name[] PROGMEM = "SwitchBot";
 const char SwitchBotControl::_enabled[] PROGMEM = "enabled";
-const char SwitchBotControl::_apiToken[] PROGMEM = "apiToken";
-const char SwitchBotControl::_secretKey[] PROGMEM = "secretKey";
-const char SwitchBotControl::_deviceId[] PROGMEM = "deviceId";
+const char SwitchBotControl::_deviceMac[] PROGMEM = "deviceMac";
 const char SwitchBotControl::_action[] PROGMEM = "action";
 
-String SwitchBotControl::generateSignature(const String& token, const String& secret, const String& t, const String& nonce) {
-  String dataToSign = token + t + nonce;
-  
-  uint8_t hmacResult[32]; 
-  mbedtls_md_context_t ctx;
-  mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
-  
-  mbedtls_md_init(&ctx);
-  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 1);
-  mbedtls_md_hmac_starts(&ctx, (const unsigned char*)secret.c_str(), secret.length());
-  mbedtls_md_hmac_update(&ctx, (const unsigned char*)dataToSign.c_str(), dataToSign.length());
-  mbedtls_md_hmac_finish(&ctx, hmacResult);
-  mbedtls_md_free(&ctx);
-  
-  String sign = "";
-  for (int i = 0; i < 32; i++) {
-    char buf[3]; 
-    snprintf(buf, sizeof(buf), "%02X", hmacResult[i]);
-    sign += buf;
-  }
-  return sign;
-}
-
-bool SwitchBotControl::sendSwitchBotCommand(uint8_t actionToSnd) {
-  if (deviceId.isEmpty() || apiToken.isEmpty() || secretKey.isEmpty() || !WLED_CONNECTED) {
+bool SwitchBotControl::sendBLECommand(uint8_t actionToSnd) {
+  if (deviceMacAddress.isEmpty()) {
     return false;
   }
-  
-  // Offizieller Endpunkt v1.1 von SwitchBot
-  String url = "https://switch-bot.com" + deviceId + "/commands";
-  
-  Toki::Time tm = toki.getTime();
-  String t = String((unsigned long long)tm.sec * 1000ULL + tm.ms);
-  if (tm.sec == 0) t = String(millis()); 
-  
-  String nonce = "WLEDUserMod"; 
-  String sign = generateSignature(apiToken, secretKey, t, nonce);
-  
-  StaticJsonDocument<256> doc;
-  doc["command"] = getActionString(actionToSnd);
-  doc["parameter"] = "default";
-  doc["commandType"] = "command";
-  
-  String payload;
-  serializeJson(doc, payload);
 
-  HTTPClient http;
-  http.begin(url);
+  BLEAddress bleAddr(deviceMacAddress.c_str());
+  BLEClient* pClient = BLEDevice::createClient();
   
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", apiToken);
-  http.addHeader("sign", sign);
-  http.addHeader("t", t);
-  http.addHeader("nonce", nonce);
-  
-  http.setTimeout(2000); 
-  int httpCode = http.POST(payload);
-  
-  if (httpCode > 0) {
-    DEBUG_PRINTF("SwitchBot API HTTP Code: %d\n", httpCode);
-  } else {
-    DEBUG_PRINTF("SwitchBot API Verbindungsfehler: %s\n", http.errorToString(httpCode).c_str());
+  if (!pClient->connect(bleAddr, BLE_ADDR_TYPE_RANDOM)) {
+    DEBUG_PRINTLN(F("Failed to connect to SwitchBot PM1"));
+    delete pClient;
+    return false;
   }
+
+  // SwitchBot Service UUID
+  BLEUUID serviceUUID("cba20d00-224d-11e6-9fb8-0002a5d5c51b");
+  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
   
-  http.end();
-  return (httpCode == 200);
+  if (!pRemoteService) {
+    DEBUG_PRINTLN(F("SwitchBot service not found"));
+    pClient->disconnect();
+    delete pClient;
+    return false;
+  }
+
+  // Command Characteristic UUID
+  BLEUUID charUUID("cba20002-224d-11e6-9fb8-0002a5d5c51b");
+  BLERemoteCharacteristic* pRemoteChar = pRemoteService->getCharacteristic(charUUID);
+  
+  if (!pRemoteChar) {
+    DEBUG_PRINTLN(F("SwitchBot command characteristic not found"));
+    pClient->disconnect();
+    delete pClient;
+    return false;
+  }
+
+  // Command senden (1 Byte)
+  uint8_t commandByte = getCommandByte(actionToSnd);
+  uint8_t command[3] = {0x57, 0x01, commandByte}; // 0x57=Switch command, 0x01=press, commandByte=action
+  
+  pRemoteChar->writeValue(command, 3, false);
+  DEBUG_PRINTF("SwitchBot PM1 command sent: %02X\n", commandByte);
+
+  delay(500);
+  pClient->disconnect();
+  delete pClient;
+  return true;
 }
 
-String SwitchBotControl::getActionString(uint8_t actionToSnd) {
+uint8_t SwitchBotControl::getCommandByte(uint8_t actionToSnd) {
   switch (actionToSnd) {
-    case 0: return F("toggle"); 
-    case 1: return F("turnOn");
-    case 2: return F("turnOff");
-    default: return F("toggle");
+    case 0: return 0x00; // Press (Toggle)
+    case 1: return 0x01; // Turn On
+    case 2: return 0x02; // Turn Off
+    default: return 0x00;
   }
 }
 
