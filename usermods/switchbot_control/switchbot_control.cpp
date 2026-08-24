@@ -46,7 +46,7 @@ class SwitchBotControl : public Usermod {
      * Fängt Web-Aufrufe über den Standard /win Pfad ab.
      * Aufrufbar im Browser über: http://<ESP-IP>/win&SB=toggle
      */
-    void handleHttpGet(AsyncWebServerRequest *request) override {
+  void handleHttpGet(AsyncWebServerRequest *request) {
       if (!enabled || !initDone || apiToken.isEmpty() || secretKey.isEmpty() || deviceId.isEmpty()) return;
 
       // Prüfen, ob der "SB" Parameter in der URL vorkommt
